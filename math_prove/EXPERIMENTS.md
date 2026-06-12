@@ -23,21 +23,29 @@
 在仓库目录运行：
 
 ```powershell
-cd D:\lagent-main\lagent
+cd D:\Challenge-Cup-2026
 ```
 
 确认命令可用：
 
 ```powershell
+uv run python -m compileall -q user_agent.py math_prove
 uv run python -m math_prove.main --help
 uv run python -m math_prove.evaluate --help
 ```
 
-配置 Intern-S1 API：
+配置 Intern-S1 API。消融脚本调用的是 `math_prove` 独立实验路径，因此使用 OpenAI-compatible 环境变量：
 
 ```powershell
 $env:OPENAI_API_KEY = "your-internlm-api-token"
 $env:LLM_API_BASE = "https://chat.intern-ai.org.cn/api/v1/chat/completions"
+```
+
+如果只想跑当前比赛仓库的根目录 sample runner，请使用：
+
+```powershell
+$env:INTERN_API_KEY = "your-internlm-api-token"
+uv run python main.py --input_file sample_data/dev.jsonl --output_dir sample_outputs
 ```
 
 先用 `--dry-run` 看命令，不会调用 API：

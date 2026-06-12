@@ -1,6 +1,17 @@
 # MathSolve-Agent 中文说明
 
-`math_prove/` 是基于 `lagent` 构建的单智能体数学解题系统。它的目标不是展示界面，而是稳定批量处理数学题，输出可判分的结构化 JSON，并支持本地验证、准确率统计和消融实验。
+`math_prove/` 是从 `Cat-blizzard/mathsolve-agent` 迁入本仓库的 MathSolve-Agent 实现。它在当前 `Challenge-Cup-2026` 仓库中不是平台入口本身，而是根目录 `user_agent.py` 背后的数学求解引擎与本地实验工具。
+
+正式比赛入口仍然是仓库根目录的：
+
+```python
+from user_agent import ReasoningAgent
+
+agent = ReasoningAgent(client=official_client)
+result = agent.solve(problem, metadata)
+```
+
+`ReasoningAgent` 会使用平台传入的 `client.chat(...)`，调用 `math_prove.agent.MathSolverAgent`，再把内部 `MathSolution.answer` 映射成比赛要求的 `final_response`。
 
 ## 核心能力
 
@@ -17,6 +28,23 @@
 - 消融实验：支持 base、safe、safe_plus、strong 等配置对照。
 - 支持串行批量运行，也支持带全局 RPM 限流的旁路并发批量脚本。
 
+## 与比赛提交入口的关系
+
+当前仓库的提交入口在根目录 `user_agent.py`，它做了三件事：
+
+1. 接收官方 runner 注入的 `client`，不在提交代码里硬编码 API key。
+2. 过滤 `metadata` 中可能出现的本地调试答案字段，避免依赖样例标准答案。
+3. 调用 `MathSolverAgent`，并返回平台要求的：
+
+```python
+{
+  "final_response": "...",
+  "trace": [...]
+}
+```
+
+默认使用 `MATH_PROVE_ABLATION=official_stable`，可通过环境变量调整为 `safe`、`safe_plus` 等 preset。正式提交时通常保持默认值即可。
+
 ## 目录结构
 
 ```text
@@ -31,6 +59,7 @@ math_prove/
 ├── prompts.py                  # 诊断、求解、验证、抽取 prompt
 ├── run_ablation_experiments.py # 一键消融实验调度器
 ├── run_parallel_batch.py       # 旁路并发批量脚本
+├── run_prompt_baseline.py      # 裸 prompt 对照实验脚本
 ├── sandbox.py                  # SymPy / NumPy / SciPy / OR-Tools 辅助验证
 ├── validator.py                # schema、等价验证、提交前体检
 ├── validation/
@@ -40,10 +69,10 @@ math_prove/
 
 ## uv 安装
 
-在 lagent 根目录执行：
+在当前比赛仓库根目录执行：
 
 ```powershell
-cd D:\lagent-main\lagent
+cd D:\Challenge-Cup-2026
 ```
 
 安装 uv：
@@ -56,23 +85,40 @@ uv --version
 创建并激活虚拟环境：
 
 ```powershell
-uv venv ..\.venv
-..\.venv\Scripts\Activate.ps1
+uv venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
 安装依赖：
 
 ```powershell
 uv pip install -r requirements.txt
-uv pip install -e .
-uv pip install sympy scipy numpy pandas pyarrow openpyxl pydantic ortools
 ```
 
-`pandas pyarrow` 主要用于读取 TheoremQA 的 parquet 文件。
+如需运行外部数据集转换、sandbox 或 OR-Tools 相关实验，再安装可选依赖：
 
-## Intern-S1 API 配置
+```powershell
+uv pip install scipy numpy pandas pyarrow openpyxl ortools
+```
 
-当前项目使用书生 API 的 OpenAI-compatible Chat Completions 接口：
+`pandas`、`pyarrow` 主要用于读取 TheoremQA 的 parquet 文件；`ortools` 只在打开对应 sandbox / optimization preset 时需要。
+
+## 当前比赛仓库本地调试
+
+根目录 `main.py` 会创建 `InternChatClient`，再实例化 `ReasoningAgent(client=client)`，这条路径最接近平台 runner：
+
+```powershell
+$env:INTERN_API_KEY = "your-internlm-api-token"
+$env:INTERN_MODEL = "intern-s2-preview"
+
+uv run python main.py --input_file sample_data/dev.jsonl --output_dir sample_outputs
+```
+
+这会调用根目录 `user_agent.py`，最终结果按比赛格式写到 `sample_outputs/`。
+
+## math_prove 独立实验 API 配置
+
+`math_prove.main`、`run_parallel_batch`、`evaluate --run` 等独立实验脚本沿用 OpenAI-compatible Chat Completions 配置：
 
 ```powershell
 $env:OPENAI_API_KEY = "your-internlm-api-token"
@@ -87,6 +133,8 @@ $env:LLM_API_BASE = "https://chat.intern-ai.org.cn/api/v1/chat/completions"
 
 注意：
 
+- 运行根目录比赛 runner 时使用 `INTERN_API_KEY`。
+- 运行 `math_prove` 独立实验脚本时使用 `OPENAI_API_KEY` 和 `LLM_API_BASE`。
 - `OPENAI_API_KEY` 只填 token，不手写 `Bearer`。
 - 当前不使用 Claude-like `/v1/messages` 接口。
 - Intern-S1 可能输出 `<think>...</think>`，代码会在 JSON 解析前清洗。
@@ -391,13 +439,15 @@ base_ortools_verify
 ## 本地检查
 
 ```powershell
-uv run python -m py_compile math_prove\*.py
+uv run python -m compileall -q user_agent.py math_prove
+uv run python -c "import main; from user_agent import ReasoningAgent; print('imports ok')"
 uv run python -m math_prove.main --help
 uv run python -m math_prove.evaluate --help
 uv run python -m math_prove.convert_benchmarks --help
 uv run python -m math_prove.run_parallel_batch --help
-uv run --with pytest python -m pytest tests\test_math_prove\test_accuracy_guards.py -q
 ```
+
+如果没有配置真实 API key，可以用假 `client.chat` 对 `ReasoningAgent.solve` 做 smoke test；真实模型调用需要有效的 Intern-S API key。
 
 ## GitHub 注意事项
 
@@ -417,6 +467,8 @@ API key
 可以提交：
 
 ```text
+user_agent.py
+requirements.txt
 math_prove/*.py
 math_prove/README.md
 math_prove/README_CN.md

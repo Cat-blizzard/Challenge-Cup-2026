@@ -2,10 +2,23 @@
 
 Chinese guide: [README_CN.md](README_CN.md).
 
-`math_prove/` is a single-agent math-solving system built on top of `lagent`.
-It is designed for stable batch evaluation rather than a web demo or a
-multi-agent showcase. The system focuses on judgeable JSON output, per-problem
-logs, local validation, accuracy reporting, and benchmark conversion.
+`math_prove/` is the MathSolve-Agent implementation migrated from
+`Cat-blizzard/mathsolve-agent` into this `Challenge-Cup-2026` repository. In
+this repository it is not the platform entrypoint itself; it is the math solver
+engine and local experiment toolkit used by the root `user_agent.py`.
+
+The formal competition entrypoint remains:
+
+```python
+from user_agent import ReasoningAgent
+
+agent = ReasoningAgent(client=official_client)
+result = agent.solve(problem, metadata)
+```
+
+`ReasoningAgent` uses the injected `client.chat(...)`, calls
+`math_prove.agent.MathSolverAgent`, and maps the internal `MathSolution.answer`
+to the required `final_response`.
 
 ## What It Does
 
@@ -28,6 +41,25 @@ logs, local validation, accuracy reporting, and benchmark conversion.
 - Can run batches serially or through a sidecar parallel runner with a global
   RPM limiter.
 
+## Competition Entrypoint
+
+The submitted interface lives in the repository root at `user_agent.py`. It:
+
+1. accepts the official runner's injected `client`, without hard-coding API keys;
+2. filters local-debug answer fields from `metadata`; and
+3. returns the required competition shape:
+
+```python
+{
+  "final_response": "...",
+  "trace": [...]
+}
+```
+
+The default preset is `MATH_PROVE_ABLATION=official_stable`. You can override it
+with `safe`, `safe_plus`, or another configured preset for local experiments,
+but the default is the intended formal-submission path.
+
 ## Project Layout
 
 ```text
@@ -42,6 +74,7 @@ math_prove/
 ├── prompts.py                  # Diagnosis, solve, verify, extract prompts
 ├── run_ablation_experiments.py # One-command ablation scheduler
 ├── run_parallel_batch.py       # Sidecar concurrent batch runner
+├── run_prompt_baseline.py      # Bare-prompt control runner
 ├── sandbox.py                  # SymPy / NumPy / SciPy / OR-Tools helpers
 ├── validator.py                # Schema, equivalence, and preflight checks
 ├── validation/
@@ -51,10 +84,10 @@ math_prove/
 
 ## Install With uv
 
-Run from the lagent repository root:
+Run from the Challenge Cup repository root:
 
 ```powershell
-cd D:\lagent-main\lagent
+cd D:\Challenge-Cup-2026
 ```
 
 Install uv:
@@ -67,24 +100,43 @@ uv --version
 Create and activate the virtual environment:
 
 ```powershell
-uv venv ..\.venv
-..\.venv\Scripts\Activate.ps1
+uv venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
 Install dependencies:
 
 ```powershell
 uv pip install -r requirements.txt
-uv pip install -e .
-uv pip install sympy scipy numpy pandas pyarrow openpyxl pydantic ortools
+```
+
+Install optional experiment dependencies only when you need benchmark
+conversion, sandbox, or OR-Tools presets:
+
+```powershell
+uv pip install scipy numpy pandas pyarrow openpyxl ortools
 ```
 
 `pandas` and `pyarrow` are needed for converting TheoremQA parquet files.
+`ortools` is only needed when enabling the matching optimization presets.
 
-## Intern-S1 API Setup
+## Local Competition-Style Run
 
-The current implementation uses the InternLM OpenAI-compatible Chat
-Completions endpoint through `lagent.llms.GPTAPI`.
+The root `main.py` creates `InternChatClient`, initializes
+`ReasoningAgent(client=client)`, and writes competition-shaped outputs. This is
+the closest local path to the official runner:
+
+```powershell
+$env:INTERN_API_KEY = "your-internlm-api-token"
+$env:INTERN_MODEL = "intern-s2-preview"
+
+uv run python main.py --input_file sample_data/dev.jsonl --output_dir sample_outputs
+```
+
+## Standalone math_prove API Setup
+
+Standalone scripts such as `math_prove.main`, `run_parallel_batch`, and
+`evaluate --run` still use OpenAI-compatible Chat Completions settings:
 
 ```powershell
 $env:OPENAI_API_KEY = "your-internlm-api-token"
@@ -99,6 +151,8 @@ Use the model name at runtime:
 
 Notes:
 
+- Use `INTERN_API_KEY` for the root competition-style runner.
+- Use `OPENAI_API_KEY` and `LLM_API_BASE` for standalone `math_prove` scripts.
 - Put only the token in `OPENAI_API_KEY`; do not include `Bearer`.
 - This project does not use the Claude-like `/v1/messages` API.
 - Intern-S1 may emit `<think>...</think>` or Markdown JSON wrappers. The agent
@@ -451,13 +505,16 @@ Suggested use:
 ## Local Checks
 
 ```powershell
-uv run python -m py_compile math_prove\*.py
+uv run python -m compileall -q user_agent.py math_prove
+uv run python -c "import main; from user_agent import ReasoningAgent; print('imports ok')"
 uv run python -m math_prove.main --help
 uv run python -m math_prove.evaluate --help
 uv run python -m math_prove.convert_benchmarks --help
 uv run python -m math_prove.run_parallel_batch --help
-uv run --with pytest python -m pytest tests\test_math_prove\test_accuracy_guards.py -q
 ```
+
+Without a real API key, use a fake `client.chat` smoke test for
+`ReasoningAgent.solve`. Real model calls require a valid Intern-S API key.
 
 ## GitHub Notes
 
@@ -477,6 +534,8 @@ large external datasets
 Safe to commit:
 
 ```text
+user_agent.py
+requirements.txt
 math_prove/*.py
 math_prove/README.md
 math_prove/README_CN.md
