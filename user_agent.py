@@ -1,184 +1,159 @@
+"""Competition entrypoint backed by the migrated MathSolve-Agent design."""
+
+from __future__ import annotations
+
+import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List
 
-from lagent.agents import Agent
-from lagent.schema import AgentMessage
-
-from llm_client import InternChatClient
-
-
-# ==================== PARTICIPANT DESIGN AREA START ====================
-
-POLICY_PROMPT = """你是一个严谨的数学推理智能体。
-请解决用户给出的数学问题，并给出清晰推理与最终答案。
-
-要求：
-1. 先分析题意和关键条件。
-2. 给出必要的推导步骤。
-3. 在最后明确写出最终答案。
-"""
-
-VERIFIER_PROMPT = """你是一个数学答案验证器。
-请判断候选解答是否正确解决了题目。
-
-不要输出解释。只输出以下两行之一：
-VERDICT: A
-或
-VERDICT: B
-
-其中 A 表示候选解答正确，B 表示候选解答错误。
-"""
-
-
-@dataclass
-class AgentConfig:
-    policy_sample_times: int = 3
-    verifier_voting_times: int = 2
-    policy_temperature: float = 0.6
-    verifier_temperature: float = 0.0
-    max_tokens: int = 4096
+from math_prove.agent import MathSolverAgent
 
 
 class ReasoningAgent:
-    """A simple lagent-based generate-verify-select baseline agent."""
+    """Adapter from the Challenge Cup interface to MathSolve-Agent."""
 
-    def __init__(self, client: InternChatClient, config: AgentConfig | None = None) -> None:
-        self.config = config or AgentConfig()
-        self.policy_agent = Agent(
-            llm=client,
-            template=POLICY_PROMPT,
-            name="policy_agent",
+    def __init__(self, client: Any, *args: Any, **kwargs: Any) -> None:
+        del args
+        self.client = client
+        self.ablation = str(
+            kwargs.pop("ablation", os.environ.get("MATH_PROVE_ABLATION", "official_stable"))
         )
-        self.verifier_agent = Agent(
-            llm=client,
-            template=VERIFIER_PROMPT,
-            name="verifier_agent",
+        self.model_type = str(
+            kwargs.pop("model_type", os.environ.get("INTERN_MODEL", "intern-s2-preview"))
+        )
+        self.temperature = float(kwargs.pop("temperature", 0.0))
+        self.max_tokens = int(kwargs.pop("max_tokens", 4096))
+        self.solver = MathSolverAgent(
+            client=client,
+            model_type=self.model_type,
+            temperature=self.temperature,
+            max_new_tokens=self.max_tokens,
+            ablation=self.ablation,
         )
 
     def solve(self, problem: str, metadata: Dict) -> Dict:
-        idx = metadata.get("idx", 0)
-        candidates, trace = self._generate_candidates(problem, idx)
-        scored_candidates = []
+        problem_id = self._problem_id(metadata)
+        safe_metadata = self._safe_metadata(metadata)
 
-        for candidate_id, candidate in enumerate(candidates):
-            confidence, verify_trace = self._verify_candidate(
-                problem,
-                candidate,
-                idx,
-                candidate_id,
-            )
-            scored_candidates.append(
-                {
-                    "content": candidate,
-                    "confidence_score": confidence,
-                }
-            )
-            trace.extend(verify_trace)
-
-        best = max(scored_candidates, key=lambda item: item["confidence_score"])
-        trace.append(
-            {
-                "step": "select_final_response",
-                "content": f"Selected candidate with confidence {best['confidence_score']:.3f}.",
-            }
+        solution = self.solver.solve(
+            problem=problem,
+            problem_id=problem_id,
+            raw_metadata=safe_metadata,
         )
+        final_response = str(solution.answer or "").strip()
+        trace = self._build_trace(solution, self.solver.last_run_log)
+
+        if not final_response or final_response == "unable_to_determine":
+            fallback_answer, fallback_trace = self._direct_fallback(problem)
+            if fallback_answer:
+                final_response = fallback_answer
+                trace.extend(fallback_trace)
+
         return {
-            "final_response": best["content"],
+            "final_response": final_response or "unable_to_determine",
             "trace": trace,
         }
 
-    def _generate_candidates(self, problem: str, idx: int) -> Tuple[List[str], List[Dict]]:
-        candidates = []
-        trace = []
-        for sample_id in range(self.config.policy_sample_times):
-            user_message = AgentMessage(
-                sender="user",
-                content=f"题目：\n{problem}\n\n请给出完整解答。候选编号：{sample_id}",
-            )
-            response = self.policy_agent(
-                user_message,
-                session_id=f"{idx}:policy:{sample_id}",
-                temperature=self.config.policy_temperature,
-                max_tokens=self.config.max_tokens,
-            )
-            candidates.append(response.content)
-            trace.append(
-                {
-                    "step": f"policy_call_{sample_id}",
-                    "content": {
-                        "message": user_message.content,
-                        "response": response.content,
-                    },
-                }
-            )
-        return candidates, trace
-
-    def _verify_candidate(
-        self,
-        problem: str,
-        candidate: str,
-        idx: int,
-        candidate_id: int,
-    ) -> Tuple[float, List[Dict]]:
-        votes = []
-        trace = []
-        for vote_id in range(self.config.verifier_voting_times):
-            user_message = AgentMessage(
-                sender="user",
-                content=(
-                    "题目：\n"
-                    f"{problem}\n\n"
-                    "候选解答：\n"
-                    f"{candidate}\n\n"
-                    "请判断候选解答是否正确。\n"
-                    "只输出一行：VERDICT: A 或 VERDICT: B。"
-                ),
-            )
-            response = self.verifier_agent(
-                user_message,
-                session_id=f"{idx}:verify:{candidate_id}:{vote_id}",
-                temperature=self.config.verifier_temperature,
-                max_tokens=1024,
-            )
-            verdict = response.content
-            votes.append(self._is_correct_vote(verdict))
-            trace.append(
-                {
-                    "step": f"verifier_call_{candidate_id}_{vote_id}",
-                    "content": {
-                        "candidate_id": candidate_id,
-                        "message": user_message.content,
-                        "response": verdict,
-                    },
-                }
-            )
-
-        confidence = sum(votes) / len(votes) if votes else 0.0
-        return confidence, trace
+    @staticmethod
+    def _problem_id(metadata: Dict) -> str:
+        metadata = metadata or {}
+        for key in ("idx", "problem_id", "id"):
+            value = metadata.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return "0"
 
     @staticmethod
-    def _is_correct_vote(verdict: str) -> bool:
-        verdict_matches = re.findall(
-            r"\bVERDICT\s*[:：]\s*([AB])\s*[。.]?",
-            verdict,
-            flags=re.IGNORECASE,
-        )
-        if verdict_matches:
-            return verdict_matches[-1].upper() == "A"
+    def _safe_metadata(metadata: Dict) -> Dict:
+        blocked = {
+            "answer",
+            "expected",
+            "expected_answer",
+            "reference",
+            "reference_answer",
+            "gold",
+            "label",
+        }
+        return {
+            str(key): value
+            for key, value in (metadata or {}).items()
+            if str(key).lower() not in blocked
+        }
 
-        label_matches = re.findall(
-            r"^\s*([AB])\s*[。.]?\s*$",
-            verdict,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        if label_matches:
-            return label_matches[-1].upper() == "A"
+    @staticmethod
+    def _build_trace(solution: Any, run_log: Dict[str, Any]) -> List[Dict[str, Any]]:
+        trace: List[Dict[str, Any]] = [
+            {
+                "step": "diagnosis",
+                "content": {
+                    "domain": solution.domain,
+                    "answer_type": solution.answer_type,
+                },
+            },
+            {
+                "step": "reasoning_summary",
+                "content": solution.reasoning_summary,
+            },
+            {
+                "step": "key_steps",
+                "content": solution.key_steps,
+            },
+            {
+                "step": "verification",
+                "content": {
+                    "passed": solution.verification.passed,
+                    "confidence": solution.verification.confidence,
+                    "issues": solution.verification.issues,
+                },
+            },
+        ]
+        for stage in (run_log or {}).get("stages", [])[:8]:
+            trace.append(
+                {
+                    "step": str(stage.get("stage", "model_stage")),
+                    "content": {
+                        "response_preview": stage.get("cleaned_response_preview", ""),
+                        "error": stage.get("error", ""),
+                    },
+                }
+            )
+        return trace
 
-        words = re.findall(r"\b[A-Z]+\b", verdict.upper())
-        if "INCORRECT" in words:
-            return False
-        return "CORRECT" in words
+    def _direct_fallback(self, problem: str) -> tuple[str, List[Dict[str, Any]]]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful mathematics solver. Solve the problem and put "
+                    "the shortest judgeable result on the last line as "
+                    "Final Answer: <answer>."
+                ),
+            },
+            {"role": "user", "content": f"Problem:\n{problem}"},
+        ]
+        try:
+            raw = self.client.chat(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=min(self.max_tokens, 4096),
+            )
+        except TypeError:
+            raw = self.client.chat(
+                messages,
+                temperature=0.0,
+                max_tokens=min(self.max_tokens, 4096),
+            )
+        except Exception as exc:  # noqa: BLE001 - single item fallback should not crash.
+            return "", [{"step": "direct_fallback_error", "content": str(exc)}]
 
+        text = str(raw or "").strip()
+        answer = self._extract_final_answer(text)
+        return answer, [{"step": "direct_fallback", "content": text[:1200]}]
 
-# ===================== PARTICIPANT DESIGN AREA END =====================
+    @staticmethod
+    def _extract_final_answer(text: str) -> str:
+        matches = re.findall(r"Final Answer\s*[:：]\s*(.+)", text, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[-1] if lines else ""

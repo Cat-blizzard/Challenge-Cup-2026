@@ -1,4 +1,6 @@
 requests>=2.31.0
+pydantic>=2.0
+sympy>=1.12
 lagent @ git+https://github.com/InternLM/lagent.git@0ab2e2f550477884743cd63fbca7bc4aa7b00290
 openai
 anthropic
